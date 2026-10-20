@@ -43,9 +43,12 @@ def graphql(query, variables=None):
                 msg = json.dumps(body["errors"])
                 if "RATE_LIMIT" in msg or "rate limit" in msg.lower() or "secondary" in msg.lower():
                     time.sleep(attempt * 20 + 5)
-                    # rebuild request (same data) and retry
                     req = urllib.request.Request(GRAPHQL_ENDPOINT, data=data, headers={"Authorization": f"Bearer {STARS_TOKEN}", "Content-Type": "application/json", "Accept": "application/vnd.github+json"}, method="POST")
                     continue
+                # Partial errors (e.g. org-forbidden fine-grained access): proceed if data present
+                if body.get("data") is not None:
+                    print(f"GraphQL partial errors: {msg}", file=sys.stderr)
+                    return body["data"]
                 raise RuntimeError(msg)
             return body["data"]
         except urllib.error.HTTPError as e:
@@ -105,7 +108,7 @@ def fetch_lists():
             }"""
             d = graphql(q, {"listId": ul["id"], "cursor": cursor})
             conn = d["node"]["items"]
-            members.extend(n for n in conn["nodes"] if n)
+            members.extend(n for n in (conn.get("nodes") or []) if n)
             if not conn["pageInfo"]["hasNextPage"]:
                 break
             cursor = conn["pageInfo"]["endCursor"]
