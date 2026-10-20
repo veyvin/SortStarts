@@ -1,11 +1,5 @@
 #!/usr/bin/env python3
-"""Daily organizer for GitHub starred repos into Star Lists.
-
-- Fetches all starred repos and existing Star Lists.
-- Skips repos already present in any list.
-- Classifies new repos with GitHub Models (AI).
-- Creates lists as needed and assigns repos.
-"""
+"""Daily organizer for GitHub starred repos into Star Lists."""
 import json
 import os
 import subprocess
@@ -18,48 +12,78 @@ STARS_TOKEN = os.environ.get("STARS_TOKEN") or os.environ.get("GH_TOKEN")
 MODELS_TOKEN = os.environ.get("MODELS_TOKEN") or STARS_TOKEN
 MODEL = os.environ.get("MODEL", "openai/gpt-4o-mini")
 MODELS_ENDPOINT = os.environ.get("MODELS_ENDPOINT", "https://models.github.ai/inference/chat/completions")
+GRAPHQL_ENDPOINT = "https://api.github.com/graphql"
+REST_BASE = "https://api.github.com"
 
 if not STARS_TOKEN:
     print("STARS_TOKEN is required", file=sys.stderr)
     sys.exit(1)
 
-os.environ["GH_TOKEN"] = STARS_TOKEN
+
+def graphql(query, variables=None):
+    payload = {"query": query}
+    if variables:
+        payload["variables"] = variables
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        GRAPHQL_ENDPOINT,
+        data=data,
+        headers={
+            "Authorization": f"Bearer {STARS_TOKEN}",
+            "Content-Type": "application/json",
+            "Accept": "application/vnd.github+json",
+        },
+        method="POST",
+    )
+    for attempt in range(6):
+        try:
+            with urllib.request.urlopen(req, timeout=120) as resp:
+                body = json.loads(resp.read().decode("utf-8"))
+            if body.get("errors"):
+                msg = json.dumps(body["errors"])
+                if "RATE_LIMIT" in msg or "rate limit" in msg.lower() or "secondary" in msg.lower():
+                    time.sleep(attempt * 20 + 5)
+                    # rebuild request (same data) and retry
+                    req = urllib.request.Request(GRAPHQL_ENDPOINT, data=data, headers={"Authorization": f"Bearer {STARS_TOKEN}", "Content-Type": "application/json", "Accept": "application/vnd.github+json"}, method="POST")
+                    continue
+                raise RuntimeError(msg)
+            return body["data"]
+        except urllib.error.HTTPError as e:
+            if e.code == 429 or e.code >= 500:
+                time.sleep(attempt * 20 + 5)
+                continue
+            raise RuntimeError(f"HTTP {e.code}: {e.read().decode()[:300]}")
+        except Exception as e:
+            time.sleep(attempt * 10 + 5)
+    raise RuntimeError("graphql retries exhausted")
 
 
-def gh(*args):
-    return subprocess.run(["gh", *args], check=True, capture_output=True, text=True)
-
-
-def gql(query, **variables):
-    cmd = ["gh", "api", "graphql", "-f", f"query={query}"]
-    for k, v in variables.items():
-        if v is not None:
-            cmd.extend(["-f", f"{k}={v}"])
-    proc = gh(*cmd[1:]) if False else subprocess.run(cmd, check=True, capture_output=True, text=True)
-    body = json.loads(proc.stdout)
-    if body.get("errors"):
-        raise RuntimeError(json.dumps(body["errors"]))
-    return body["data"]
+def rest_get(path):
+    url = REST_BASE + path
+    req = urllib.request.Request(url, headers={"Authorization": f"Bearer {STARS_TOKEN}", "Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28"})
+    with urllib.request.urlopen(req, timeout=120) as resp:
+        return json.loads(resp.read().decode("utf-8")), resp.headers
 
 
 def fetch_starred():
-    proc = subprocess.run(
-        ["gh", "api", "/user/starred?per_page=100", "--paginate", "--jq", ".[]"],
-        check=True, capture_output=True, text=True,
-    )
     repos = []
-    for line in proc.stdout.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        repos.append(json.loads(line))
+    page = 1
+    while True:
+        data, headers = rest_get(f"/user/starred?per_page=100&page={page}")
+        if not data:
+            break
+        repos.extend(data)
+        # check link header for next
+        link = headers.get("Link", "")
+        if 'rel="next"' not in link:
+            break
+        page += 1
     return repos
 
 
 def fetch_lists():
-    data = gql("query { viewer { lists(first: 100) { nodes { id name description items(first: 1) { totalCount } } } } }")
+    data = graphql("query { viewer { lists(first: 100) { nodes { id name description } } } }")
     lists = data["viewer"]["lists"]["nodes"]
-    # fetch full membership ids per list
     result = []
     for ul in lists:
         members = []
@@ -75,7 +99,7 @@ def fetch_lists():
                 }
               }
             }"""
-            d = gql(q, listId=ul["id"], cursor=cursor)
+            d = graphql(q, {"listId": ul["id"], "cursor": cursor})
             conn = d["node"]["items"]
             members.extend(n for n in conn["nodes"] if n)
             if not conn["pageInfo"]["hasNextPage"]:
@@ -87,37 +111,24 @@ def fetch_lists():
 
 def create_list(name):
     mutation = "mutation($name: String!) { createUserList(input: {name: $name}) { list { id name } } }"
-    d = gql(mutation, name=name)
+    d = graphql(mutation, {"name": name})
     return d["createUserList"]["list"]
 
 
 def assign_repo(node_id, list_id):
-    mutation = f'mutation {{ updateUserListsForItem(input: {{itemId: "{node_id}", listIds: ["{list_id}"]}}) {{ clientMutationId }} }}'
-    # use subprocess to allow retries outside
+    mutation = "mutation($itemId: ID!, $listIds: [ID!]!) { updateUserListsForItem(input: {itemId: $itemId, listIds: $listIds}) { clientMutationId } }"
     for attempt in range(6):
         try:
-            proc = subprocess.run(
-                ["gh", "api", "graphql", "-f", f"query={mutation}"],
-                capture_output=True, text=True, timeout=60,
-            )
-            if proc.returncode == 0:
-                body = json.loads(proc.stdout)
-                if body.get("errors"):
-                    msg = json.dumps(body["errors"])
-                    if "RATE_LIMIT" in msg or "rate limit" in msg.lower() or "secondary" in msg.lower():
-                        time.sleep(attempt * 20 + 5)
-                        continue
-                    raise RuntimeError(msg)
-                if body.get("data", {}).get("updateUserListsForItem") is not None:
-                    return True
-            else:
-                out = proc.stdout + proc.stderr
-                if "RATE_LIMIT" in out or "rate limit" in out.lower() or "secondary" in out.lower():
-                    time.sleep(attempt * 20 + 5)
-                    continue
-                raise RuntimeError(out[:300])
+            d = graphql(mutation, {"itemId": node_id, "listIds": [list_id]})
+            if d.get("updateUserListsForItem") is not None:
+                return True
+            raise RuntimeError("null result")
         except Exception as e:
-            time.sleep(attempt * 10 + 5)
+            msg = str(e)
+            if "RATE_LIMIT" in msg or "rate limit" in msg.lower() or "secondary" in msg.lower():
+                time.sleep(attempt * 20 + 5)
+                continue
+            raise
     raise RuntimeError(f"retries exhausted for {node_id}")
 
 
@@ -151,14 +162,12 @@ def call_model(messages):
 def parse_json(text):
     text = text.strip()
     if text.startswith("```"):
-        # strip fences
         lines = text.splitlines()
         if lines and lines[0].startswith("```"):
             lines = lines[1:]
         if lines and lines[-1].startswith("```"):
             lines = lines[:-1]
         text = "\n".join(lines).strip()
-    # find first { ... }
     start = text.find("{")
     end = text.rfind("}")
     if start != -1 and end != -1:
@@ -167,7 +176,6 @@ def parse_json(text):
 
 
 def classify_batch(repos, categories):
-    # repos: list of dicts with id, full_name, description, language, topics
     cat_list = ", ".join(f'"{c}"' for c in categories)
     items = []
     for r in repos:
@@ -191,7 +199,6 @@ def classify_batch(repos, categories):
     ]
     content = call_model(messages)
     mapping = parse_json(content)
-    # validate
     result = {}
     for r in repos:
         rid = str(r["id"])
@@ -226,7 +233,6 @@ def main():
     if "Miscellaneous" not in categories:
         categories.append("Miscellaneous")
 
-    # classify in batches of 50
     batch_size = 50
     classification = {}
     for i in range(0, len(unorganized), batch_size):
@@ -235,7 +241,6 @@ def main():
         mapping = classify_batch(batch, categories)
         classification.update(mapping)
 
-    # ensure lists exist for all categories used
     for cat in set(classification.values()):
         if cat not in list_by_name:
             if len(list_by_name) >= 32:
@@ -248,8 +253,6 @@ def main():
             new_list = create_list(cat)
             list_by_name[cat] = {"id": new_list["id"], "name": new_list["name"], "members": []}
 
-    # assign
-    # map repo id -> node_id
     by_id = {str(r["id"]): r for r in starred}
     ok = 0
     fail = 0
@@ -270,3 +273,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+PY
