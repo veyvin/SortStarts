@@ -56,6 +56,7 @@ def graphql(query, variables=None):
                 continue
             raise RuntimeError(f"HTTP {e.code}: {body}")
         except Exception as e:
+            print(f"EXC attempt {attempt}: {repr(e)}", file=sys.stderr)
             time.sleep(attempt * 10 + 5)
     raise RuntimeError("graphql retries exhausted")
 
