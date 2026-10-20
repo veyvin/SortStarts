@@ -49,10 +49,12 @@ def graphql(query, variables=None):
                 raise RuntimeError(msg)
             return body["data"]
         except urllib.error.HTTPError as e:
+            body = e.read().decode()[:500]
+            print(f"HTTP {e.code}: {body}", file=sys.stderr)
             if e.code == 429 or e.code >= 500:
                 time.sleep(attempt * 20 + 5)
                 continue
-            raise RuntimeError(f"HTTP {e.code}: {e.read().decode()[:300]}")
+            raise RuntimeError(f"HTTP {e.code}: {body}")
         except Exception as e:
             time.sleep(attempt * 10 + 5)
     raise RuntimeError("graphql retries exhausted")
@@ -88,6 +90,7 @@ def fetch_lists():
     for ul in lists:
         members = []
         cursor = None
+        print(f"  fetching list {ul['name']}...", file=sys.stderr)
         while True:
             q = """query($listId: ID!, $cursor: String) {
               node(id: $listId) {
@@ -105,6 +108,7 @@ def fetch_lists():
             if not conn["pageInfo"]["hasNextPage"]:
                 break
             cursor = conn["pageInfo"]["endCursor"]
+            print(f"    page done, next cursor={cursor}", file=sys.stderr)
         result.append({"id": ul["id"], "name": ul["name"], "description": ul.get("description", ""), "members": members})
     return result
 
