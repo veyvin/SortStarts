@@ -1,0 +1,29 @@
+name: Organize Starred Repos
+
+on:
+  schedule:
+    - cron: "0 2 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  models: read
+
+jobs:
+  organize:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Organize stars
+        env:
+          STARS_TOKEN: ${{ secrets.STARS_TOKEN }}
+          MODELS_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          MODEL: openai/gpt-4o-mini
+        run: python scripts/organize_stars.py
